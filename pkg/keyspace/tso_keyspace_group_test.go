@@ -24,6 +24,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 
+	"github.com/pingcap/kvproto/pkg/keyspacepb"
+
 	"github.com/tikv/pd/pkg/errs"
 	"github.com/tikv/pd/pkg/keyspace/constant"
 	mcs "github.com/tikv/pd/pkg/mcs/utils/constant"
@@ -252,6 +254,71 @@ func (suite *keyspaceGroupTestSuite) TestUpdateKeyspace() {
 	kg3, err = suite.kgm.GetKeyspaceGroupByID(3)
 	re.NoError(err)
 	re.Len(kg3.Keyspaces, 1)
+}
+
+func (suite *keyspaceGroupTestSuite) TestRemoveArchivedAndTombstoneKeyspaceFromGroup() {
+	re := suite.Require()
+
+	keyspaceGroups := []*endpoint.KeyspaceGroup{
+		{
+			ID:       uint32(2),
+			UserKind: endpoint.Standard.String(),
+		},
+	}
+	err := suite.kgm.CreateKeyspaceGroups(keyspaceGroups)
+	re.NoError(err)
+
+	// Create a keyspace in group 2.
+	ks, err := suite.kg.CreateKeyspace(&CreateKeyspaceRequest{
+		Name: "test-archive",
+		Config: map[string]string{
+			UserKindKey: endpoint.Standard.String(),
+		},
+		CreateTime: time.Now().Unix(),
+	})
+	re.NoError(err)
+	kg2, err := suite.kgm.GetKeyspaceGroupByID(2)
+	re.NoError(err)
+	re.Len(kg2.Keyspaces, 1)
+	re.Contains(kg2.Keyspaces, ks.GetId())
+
+	// Archive the keyspace — it should be removed from the group.
+	_, err = suite.kg.UpdateKeyspaceState("test-archive", keyspacepb.KeyspaceState_DISABLED, time.Now().Unix())
+	re.NoError(err)
+	_, err = suite.kg.UpdateKeyspaceState("test-archive", keyspacepb.KeyspaceState_ARCHIVED, time.Now().Unix())
+	re.NoError(err)
+	kg2, err = suite.kgm.GetKeyspaceGroupByID(2)
+	re.NoError(err)
+	re.Empty(kg2.Keyspaces)
+
+	// Create another keyspace and transition it directly to TOMBSTONE (via ARCHIVED).
+	ks2, err := suite.kg.CreateKeyspace(&CreateKeyspaceRequest{
+		Name: "test-tombstone",
+		Config: map[string]string{
+			UserKindKey: endpoint.Standard.String(),
+		},
+		CreateTime: time.Now().Unix(),
+	})
+	re.NoError(err)
+	kg2, err = suite.kgm.GetKeyspaceGroupByID(2)
+	re.NoError(err)
+	re.Len(kg2.Keyspaces, 1)
+	re.Contains(kg2.Keyspaces, ks2.GetId())
+
+	_, err = suite.kg.UpdateKeyspaceState("test-tombstone", keyspacepb.KeyspaceState_DISABLED, time.Now().Unix())
+	re.NoError(err)
+	_, err = suite.kg.UpdateKeyspaceState("test-tombstone", keyspacepb.KeyspaceState_ARCHIVED, time.Now().Unix())
+	re.NoError(err)
+	kg2, err = suite.kgm.GetKeyspaceGroupByID(2)
+	re.NoError(err)
+	re.Empty(kg2.Keyspaces)
+
+	// Transition to TOMBSTONE should be idempotent (already removed from group).
+	_, err = suite.kg.UpdateKeyspaceState("test-tombstone", keyspacepb.KeyspaceState_TOMBSTONE, time.Now().Unix())
+	re.NoError(err)
+	kg2, err = suite.kgm.GetKeyspaceGroupByID(2)
+	re.NoError(err)
+	re.Empty(kg2.Keyspaces)
 }
 
 func (suite *keyspaceGroupTestSuite) TestUpdateKeyspaceGroupRollbackOnSaveError() {

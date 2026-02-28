@@ -773,6 +773,10 @@ func (manager *Manager) UpdateKeyspaceState(name string, newState keyspacepb.Key
 		zap.String("keyspace-id", meta.GetName()),
 		zap.String("new-state", newState.String()),
 	)
+	// Remove the keyspace from its group when it's archived or tombstoned.
+	if newState == keyspacepb.KeyspaceState_ARCHIVED || newState == keyspacepb.KeyspaceState_TOMBSTONE {
+		manager.removeKeyspaceFromGroup(meta)
+	}
 	return meta, nil
 }
 
@@ -816,7 +820,30 @@ func (manager *Manager) UpdateKeyspaceStateByID(id uint32, newState keyspacepb.K
 		zap.String("name", meta.GetName()),
 		zap.String("new-state", newState.String()),
 	)
+	// Remove the keyspace from its group when it's archived or tombstoned.
+	if newState == keyspacepb.KeyspaceState_ARCHIVED || newState == keyspacepb.KeyspaceState_TOMBSTONE {
+		manager.removeKeyspaceFromGroup(meta)
+	}
 	return meta, nil
+}
+
+// removeKeyspaceFromGroup removes the keyspace from its TSO keyspace group.
+// It is called when the keyspace is archived or tombstoned.
+func (manager *Manager) removeKeyspaceFromGroup(meta *keyspacepb.KeyspaceMeta) {
+	config := meta.GetConfig()
+	userKind := endpoint.StringUserKind(config[UserKindKey])
+	groupID := config[TSOKeyspaceGroupIDKey]
+	if len(groupID) == 0 {
+		return
+	}
+	if err := manager.kgm.UpdateKeyspaceForGroup(userKind, groupID, meta.GetId(), opDelete); err != nil {
+		log.Warn("[keyspace] failed to remove keyspace from group",
+			zap.Uint32("keyspace-id", meta.GetId()),
+			zap.String("name", meta.GetName()),
+			zap.String("state", meta.GetState().String()),
+			zap.Error(err),
+		)
+	}
 }
 
 // transformKeyspaceState transforms the keyspace state to the target state and record the update time.

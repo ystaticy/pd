@@ -40,7 +40,6 @@ import (
 	"github.com/tikv/pd/pkg/slice"
 	"github.com/tikv/pd/pkg/storage/endpoint"
 	"github.com/tikv/pd/pkg/storage/kv"
-	"github.com/tikv/pd/pkg/tso"
 	"github.com/tikv/pd/pkg/utils/etcdutil"
 	"github.com/tikv/pd/pkg/utils/keypath"
 	"github.com/tikv/pd/pkg/utils/logutil"
@@ -373,11 +372,6 @@ func (m *GroupManager) saveKeyspaceGroups(keyspaceGroups []*endpoint.KeyspaceGro
 	})
 	if err != nil {
 		return err
-	}
-	// Update metrics only after the transaction has committed, so that gauges
-	// never reflect a state that was not persisted (e.g. after a rollback).
-	for _, kg := range keyspaceGroups {
-		tso.SetKeyspaceGroupKeyspaceCountGauge(kg.ID, float64(len(kg.Keyspaces)))
 	}
 	return nil
 }

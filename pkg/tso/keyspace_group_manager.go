@@ -440,10 +440,11 @@ func (kgm *KeyspaceGroupManager) Initialize() error {
 		return errs.ErrLoadKeyspaceGroupsTerminated.Wrap(err)
 	}
 
-	kgm.wg.Add(3)
+	kgm.wg.Add(4)
 	go kgm.primaryPriorityCheckLoop()
 	go kgm.groupSplitPatroller()
 	go kgm.deletedGroupCleaner()
+	go kgm.keyspaceGroupMetricsSyncer()
 
 	return nil
 }
@@ -1495,6 +1496,37 @@ func (kgm *KeyspaceGroupManager) groupSplitPatroller() {
 				continue
 			}
 		}
+	}
+}
+
+// keyspaceGroupMetricsSyncer periodically syncs keyspace list length metrics from
+// in-memory keyspace group state, so metrics stay correct without depending on API calls.
+func (kgm *KeyspaceGroupManager) keyspaceGroupMetricsSyncer() {
+	defer logutil.LogPanic()
+	defer kgm.wg.Done()
+	interval := groupPatrolInterval
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	log.Info("keyspace group metrics syncer is started",
+		zap.Duration("sync-interval", interval))
+	for {
+		select {
+		case <-kgm.ctx.Done():
+			log.Info("keyspace group metrics syncer exited")
+			return
+		case <-ticker.C:
+		}
+		if kgm.metrics == nil {
+			continue
+		}
+		kgm.RLock()
+		for groupID := uint32(0); groupID < mcs.MaxKeyspaceGroupCountInUse; groupID++ {
+			kg := kgm.kgs[groupID]
+			if kg != nil {
+				SetKeyspaceListLength(groupID, float64(len(kg.Keyspaces)))
+			}
+		}
+		kgm.RUnlock()
 	}
 }
 

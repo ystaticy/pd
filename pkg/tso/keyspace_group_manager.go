@@ -1522,7 +1522,7 @@ func (kgm *KeyspaceGroupManager) keyspaceGroupMetricsSyncer() {
 		kgm.RLock()
 		for groupID, kg := range kgm.kgs {
 			if kg != nil {
-				SetKeyspaceListLength(groupID, float64(len(kg.Keyspaces)))
+				SetKeyspaceListLength(uint32(groupID), float64(len(kg.Keyspaces)))
 			}
 		}
 		kgm.RUnlock()

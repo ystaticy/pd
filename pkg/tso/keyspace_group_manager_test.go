@@ -1150,8 +1150,8 @@ func (suite *keyspaceGroupManagerTestSuite) TestPrimaryPriorityChange() {
 }
 
 // TestKeyspaceListLengthMetric tests that tso_keyspace_group_keyspace_list_length can be set
-// (e.g. by PD API saveKeyspaceGroups via SetKeyspaceGroupKeyspaceCountGauge) and removed
-// when the group is deleted (DeleteKeyspaceListLength on TSO service).
+// (by TSO keyspaceGroupMetricsSyncer or SetKeyspaceListLength/SetKeyspaceGroupKeyspaceCountGauge)
+// and removed when the group is deleted (DeleteKeyspaceListLength on TSO service).
 func (suite *keyspaceGroupManagerTestSuite) TestKeyspaceListLengthMetric() {
 	re := suite.Require()
 	groupID := uint32(1)
@@ -1162,7 +1162,7 @@ func (suite *keyspaceGroupManagerTestSuite) TestKeyspaceListLengthMetric() {
 		return out.GetGauge().GetValue()
 	}
 
-	// Test SetKeyspaceGroupKeyspaceCountGauge (used by PD API saveKeyspaceGroups)
+	// Test SetKeyspaceGroupKeyspaceCountGauge / SetKeyspaceListLength (same underlying metric)
 	SetKeyspaceGroupKeyspaceCountGauge(groupID, 3)
 	gauge, err := keyspaceGroupKeyspaceCountGauge.GetMetricWithLabelValues(strconv.FormatUint(uint64(groupID), 10))
 	re.NoError(err)

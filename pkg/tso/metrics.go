@@ -239,7 +239,7 @@ func DeleteKeyspaceListLength(groupID uint32) {
 }
 
 // SetKeyspaceGroupKeyspaceCountGauge sets the keyspace list length metric for the given keyspace group.
-// It is used by PD API service when saveKeyspaceGroups is executed.
+// The metric is periodically synced by TSO keyspaceGroupMetricsSyncer; this setter is for tests or one-off updates.
 func SetKeyspaceGroupKeyspaceCountGauge(groupID uint32, length float64) {
 	getKeyspaceGroupKeyspaceCountGauge(groupID).Set(length)
 }

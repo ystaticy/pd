@@ -1217,6 +1217,56 @@ func (suite *keyspaceGroupManagerTestSuite) TestKeyspaceListLengthMetric() {
 	}
 }
 
+// TestDeleteKeyspaceGroupTriggersDeleteKeyspaceListLength verifies that the delete flow
+// (deleteKeyspaceGroup) triggers DeleteKeyspaceListLength so the keyspace-list-length metric
+// is removed. The test calls deleteKeyspaceGroup only; it does not call DeleteKeyspaceListLength
+// directly. The merge path (mergingChecker calls DeleteKeyspaceListLength for mergeList after
+// finishMergeKeyspaceGroup) is a separate code path and is covered by integration tests
+// (e.g. tests/integrations/mcs/tso TestTSOKeyspaceGroupMerge).
+func (suite *keyspaceGroupManagerTestSuite) TestDeleteKeyspaceGroupClearsListLengthMetric() {
+	re := suite.Require()
+	metricName := "tso_keyspace_group_keyspace_list_length"
+
+	metricExists := func(mfs []*dto.MetricFamily, groupID uint32) bool {
+		groupStr := strconv.FormatUint(uint64(groupID), 10)
+		for _, mf := range mfs {
+			if mf.GetName() != metricName {
+				continue
+			}
+			for _, m := range mf.GetMetric() {
+				for _, lp := range m.GetLabel() {
+					if lp.GetName() == "group" && lp.GetValue() == groupStr {
+						return true
+					}
+				}
+			}
+			break
+		}
+		return false
+	}
+
+	// Delete path: deleteKeyspaceGroup must trigger DeleteKeyspaceListLength (no direct call in test).
+	kgm := &KeyspaceGroupManager{
+		state:   state{},
+		metrics: newKeyspaceGroupMetrics(),
+	}
+	kgm.initialize()
+	groupID := uint32(2)
+	kgm.Lock()
+	kgm.kgs[groupID] = &endpoint.KeyspaceGroup{ID: groupID, Keyspaces: []uint32{groupID}}
+	kgm.Unlock()
+
+	SetKeyspaceListLength(groupID, 10)
+	mfs, err := prometheus.DefaultGatherer.Gather()
+	re.NoError(err)
+	re.True(metricExists(mfs, groupID), "metric for group 2 should exist before delete")
+
+	kgm.deleteKeyspaceGroup(groupID)
+	mfs, err = prometheus.DefaultGatherer.Gather()
+	re.NoError(err)
+	re.False(metricExists(mfs, groupID), "deleteKeyspaceGroup should trigger DeleteKeyspaceListLength and remove metric")
+}
+
 // Register TSO server.
 func (suite *keyspaceGroupManagerTestSuite) registerTSOServer(
 	re *require.Assertions, svcAddr string, cfg *TestServiceConfig,

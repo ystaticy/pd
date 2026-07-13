@@ -26,6 +26,12 @@ const (
 	tsoNamespace = "tso"
 	typeLabel    = "type"
 	groupLabel   = "group"
+	stateLabel   = "state"
+
+	keyspaceGroupStateSplitSource = "split-source"
+	keyspaceGroupStateSplitTarget = "split-target"
+	keyspaceGroupStateMergeSource = "merge-source"
+	keyspaceGroupStateMergeTarget = "merge-target"
 )
 
 var (
@@ -80,6 +86,14 @@ var (
 			Help:      "Gauge of the Keyspace Group states.",
 		}, []string{typeLabel})
 
+	keyspaceGroupStateByGroupGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: tsoNamespace,
+			Subsystem: "keyspace_group",
+			Name:      "state_by_group",
+			Help:      "State marker of each TSO keyspace group. Value is 1 when the group is in the given state.",
+		}, []string{groupLabel, stateLabel})
+
 	keyspaceGroupOpDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: tsoNamespace,
@@ -100,6 +114,8 @@ var (
 
 	// keyspaceGroupKeyspaceCountGaugeCache caches gauge per groupID to avoid repeated WithLabelValues.
 	keyspaceGroupKeyspaceCountGaugeCache sync.Map
+	// keyspaceGroupStateByGroupGaugeCache caches gauges per group/state to avoid repeated WithLabelValues.
+	keyspaceGroupStateByGroupGaugeCache sync.Map
 )
 
 func init() {
@@ -109,6 +125,7 @@ func init() {
 	prometheus.MustRegister(tsoOpDuration)
 	prometheus.MustRegister(tsoAllocatorRole)
 	prometheus.MustRegister(keyspaceGroupStateGauge)
+	prometheus.MustRegister(keyspaceGroupStateByGroupGauge)
 	prometheus.MustRegister(keyspaceGroupOpDuration)
 	prometheus.MustRegister(keyspaceGroupKeyspaceCountGauge)
 }
@@ -200,10 +217,10 @@ type keyspaceGroupMetrics struct {
 
 func newKeyspaceGroupMetrics() *keyspaceGroupMetrics {
 	return &keyspaceGroupMetrics{
-		splitSourceGauge:        keyspaceGroupStateGauge.WithLabelValues("split-source"),
-		splitTargetGauge:        keyspaceGroupStateGauge.WithLabelValues("split-target"),
-		mergeSourceGauge:        keyspaceGroupStateGauge.WithLabelValues("merge-source"),
-		mergeTargetGauge:        keyspaceGroupStateGauge.WithLabelValues("merge-target"),
+		splitSourceGauge:        keyspaceGroupStateGauge.WithLabelValues(keyspaceGroupStateSplitSource),
+		splitTargetGauge:        keyspaceGroupStateGauge.WithLabelValues(keyspaceGroupStateSplitTarget),
+		mergeSourceGauge:        keyspaceGroupStateGauge.WithLabelValues(keyspaceGroupStateMergeSource),
+		mergeTargetGauge:        keyspaceGroupStateGauge.WithLabelValues(keyspaceGroupStateMergeTarget),
 		splitDuration:           keyspaceGroupOpDuration.WithLabelValues("split"),
 		mergeDuration:           keyspaceGroupOpDuration.WithLabelValues("merge"),
 		finishSplitSendDuration: keyspaceGroupOpDuration.WithLabelValues("finish-split-send"),
@@ -225,6 +242,67 @@ func getOrInitKeyspaceCountGauge(groupID uint32) prometheus.Gauge {
 		return actual.(prometheus.Gauge)
 	}
 	return gauge
+}
+
+type keyspaceGroupStateByGroupMetricKey struct {
+	groupID uint32
+	state   string
+}
+
+var keyspaceGroupStateByGroupValues = [...]string{
+	keyspaceGroupStateSplitSource,
+	keyspaceGroupStateSplitTarget,
+	keyspaceGroupStateMergeSource,
+	keyspaceGroupStateMergeTarget,
+}
+
+// getOrInitKeyspaceGroupStateByGroupMetrics returns the cached gauge for the group/state pair,
+// or creates one with WithLabelValues.
+func getOrInitKeyspaceGroupStateByGroupMetrics(groupID uint32, state string) prometheus.Gauge {
+	key := keyspaceGroupStateByGroupMetricKey{
+		groupID: groupID,
+		state:   state,
+	}
+	if g, ok := keyspaceGroupStateByGroupGaugeCache.Load(key); ok {
+		return g.(prometheus.Gauge)
+	}
+	groupIDLabel := strconv.FormatUint(uint64(groupID), 10)
+	gauge := keyspaceGroupStateByGroupGauge.WithLabelValues(groupIDLabel, state)
+	if actual, loaded := keyspaceGroupStateByGroupGaugeCache.LoadOrStore(key, gauge); loaded {
+		return actual.(prometheus.Gauge)
+	}
+	return gauge
+}
+
+// syncKeyspaceGroupStateByGroupMetrics aligns state_by_group metrics with the active group/state pairs.
+func syncKeyspaceGroupStateByGroupMetrics(active map[keyspaceGroupStateByGroupMetricKey]struct{}) {
+	for key := range active {
+		getOrInitKeyspaceGroupStateByGroupMetrics(key.groupID, key.state).Set(1)
+	}
+	keyspaceGroupStateByGroupGaugeCache.Range(func(rawKey, _ any) bool {
+		key := rawKey.(keyspaceGroupStateByGroupMetricKey)
+		if _, ok := active[key]; ok {
+			return true
+		}
+		deleteKeyspaceGroupStateByGroupMetrics(key.groupID, key.state)
+		return true
+	})
+}
+
+// deleteKeyspaceGroupStateByGroupMetrics removes state_by_group metrics for the given group.
+// When no states are provided, it removes all supported states for the group.
+func deleteKeyspaceGroupStateByGroupMetrics(groupID uint32, states ...string) {
+	if len(states) == 0 {
+		states = keyspaceGroupStateByGroupValues[:]
+	}
+	groupIDLabel := strconv.FormatUint(uint64(groupID), 10)
+	for _, state := range states {
+		keyspaceGroupStateByGroupGauge.DeleteLabelValues(groupIDLabel, state)
+		keyspaceGroupStateByGroupGaugeCache.Delete(keyspaceGroupStateByGroupMetricKey{
+			groupID: groupID,
+			state:   state,
+		})
+	}
 }
 
 // DeleteKeyspaceListLengthMetric removes the keyspace list length metric for the given keyspace group.

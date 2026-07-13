@@ -1617,7 +1617,48 @@ func (kgm *KeyspaceGroupManager) groupSplitPatroller() {
 	}
 }
 
-// keyspaceGroupMetricsSyncer periodically syncs keyspace list length metrics from
+// syncKeyspaceGroupStateMetrics synchronizes per-group state metrics from the in-memory
+// keyspace group state. The merge-source metrics are derived from merge targets' merge lists
+// because source groups are deleted from storage before the merge is fully finished.
+func (kgm *KeyspaceGroupManager) syncKeyspaceGroupStateMetrics() {
+	active := make(map[keyspaceGroupStateByGroupMetricKey]struct{})
+
+	kgm.RLock()
+	for _, kg := range kgm.kgs {
+		if kg == nil {
+			continue
+		}
+		if kg.IsSplitSource() {
+			active[keyspaceGroupStateByGroupMetricKey{
+				groupID: kg.ID,
+				state:   keyspaceGroupStateSplitSource,
+			}] = struct{}{}
+		}
+		if kg.IsSplitTarget() {
+			active[keyspaceGroupStateByGroupMetricKey{
+				groupID: kg.ID,
+				state:   keyspaceGroupStateSplitTarget,
+			}] = struct{}{}
+		}
+		if kg.IsMergeTarget() {
+			active[keyspaceGroupStateByGroupMetricKey{
+				groupID: kg.ID,
+				state:   keyspaceGroupStateMergeTarget,
+			}] = struct{}{}
+			for _, sourceGroupID := range kg.MergeState.MergeList {
+				active[keyspaceGroupStateByGroupMetricKey{
+					groupID: sourceGroupID,
+					state:   keyspaceGroupStateMergeSource,
+				}] = struct{}{}
+			}
+		}
+	}
+	kgm.RUnlock()
+
+	syncKeyspaceGroupStateByGroupMetrics(active)
+}
+
+// keyspaceGroupMetricsSyncer periodically syncs keyspace-group metrics from
 // in-memory keyspace group state, so metrics stay correct without depending on API calls.
 func (kgm *KeyspaceGroupManager) keyspaceGroupMetricsSyncer() {
 	defer logutil.LogPanic()
@@ -1644,6 +1685,7 @@ func (kgm *KeyspaceGroupManager) keyspaceGroupMetricsSyncer() {
 			}
 		}
 		kgm.RUnlock()
+		kgm.syncKeyspaceGroupStateMetrics()
 	}
 }
 

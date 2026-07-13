@@ -1234,6 +1234,112 @@ func (suite *keyspaceGroupManagerTestSuite) TestKeyspaceListLengthMetric() {
 	}
 }
 
+func (suite *keyspaceGroupManagerTestSuite) TestKeyspaceGroupStateByGroupMetric() {
+	re := suite.Require()
+	metricName := "tso_keyspace_group_state_by_group"
+	targetGroupIDs := []uint32{1001, 1002, 1003, 1004, 1005}
+
+	type metricKey struct {
+		group string
+		state string
+	}
+
+	targetGroups := make(map[string]struct{}, len(targetGroupIDs))
+	for _, groupID := range targetGroupIDs {
+		targetGroups[strconv.FormatUint(uint64(groupID), 10)] = struct{}{}
+	}
+
+	collectMetrics := func() map[metricKey]float64 {
+		mfs, err := prometheus.DefaultGatherer.Gather()
+		re.NoError(err)
+
+		metrics := make(map[metricKey]float64)
+		for _, mf := range mfs {
+			if mf.GetName() != metricName {
+				continue
+			}
+			for _, m := range mf.GetMetric() {
+				var groupID string
+				var state string
+				for _, lp := range m.GetLabel() {
+					switch lp.GetName() {
+					case groupLabel:
+						groupID = lp.GetValue()
+					case stateLabel:
+						state = lp.GetValue()
+					}
+				}
+				if _, ok := targetGroups[groupID]; !ok {
+					continue
+				}
+				metrics[metricKey{
+					group: groupID,
+					state: state,
+				}] = m.GetGauge().GetValue()
+			}
+			break
+		}
+		return metrics
+	}
+
+	kgm := &KeyspaceGroupManager{
+		state:   state{},
+		metrics: newKeyspaceGroupMetrics(),
+	}
+	kgm.initialize()
+	defer func() {
+		kgm.Lock()
+		for _, groupID := range targetGroupIDs {
+			kgm.kgs[groupID] = nil
+		}
+		kgm.Unlock()
+		kgm.syncKeyspaceGroupStateMetrics()
+	}()
+
+	kgm.Lock()
+	kgm.kgs[1001] = &endpoint.KeyspaceGroup{
+		ID:         1001,
+		SplitState: &endpoint.SplitState{SplitSource: 1001},
+	}
+	kgm.kgs[1002] = &endpoint.KeyspaceGroup{
+		ID:         1002,
+		SplitState: &endpoint.SplitState{SplitSource: 1001},
+	}
+	kgm.kgs[1003] = &endpoint.KeyspaceGroup{
+		ID:         1003,
+		MergeState: &endpoint.MergeState{MergeList: []uint32{1004, 1005}},
+	}
+	kgm.Unlock()
+
+	kgm.syncKeyspaceGroupStateMetrics()
+	re.Equal(map[metricKey]float64{
+		{group: "1001", state: keyspaceGroupStateSplitSource}: 1,
+		{group: "1002", state: keyspaceGroupStateSplitTarget}: 1,
+		{group: "1003", state: keyspaceGroupStateMergeTarget}: 1,
+		{group: "1004", state: keyspaceGroupStateMergeSource}: 1,
+		{group: "1005", state: keyspaceGroupStateMergeSource}: 1,
+	}, collectMetrics())
+
+	kgm.Lock()
+	kgm.kgs[1001].SplitState = nil
+	kgm.kgs[1002].SplitState = nil
+	kgm.kgs[1003].MergeState = &endpoint.MergeState{MergeList: []uint32{1005}}
+	kgm.Unlock()
+
+	kgm.syncKeyspaceGroupStateMetrics()
+	re.Equal(map[metricKey]float64{
+		{group: "1003", state: keyspaceGroupStateMergeTarget}: 1,
+		{group: "1005", state: keyspaceGroupStateMergeSource}: 1,
+	}, collectMetrics())
+
+	kgm.Lock()
+	kgm.kgs[1003].MergeState = nil
+	kgm.Unlock()
+
+	kgm.syncKeyspaceGroupStateMetrics()
+	re.Empty(collectMetrics())
+}
+
 // TestDeleteKeyspaceGroupClearsListLengthMetric verifies that the delete flow
 // (deleteKeyspaceGroup) triggers DeleteKeyspaceListLengthMetric so the keyspace-list-length metric
 // is removed. The test calls deleteKeyspaceGroup only; it does not call DeleteKeyspaceListLengthMetric

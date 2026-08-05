@@ -18,6 +18,8 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -37,6 +39,9 @@ import (
 )
 
 var _ rmpb.ResourceManagerServer = (*Service)(nil)
+
+// mockGetResourceGroupErrorEnvKey enables local-only error injection for GetResourceGroup.
+const mockGetResourceGroupErrorEnvKey = "PD_MCS_RM_MOCK_GET_RESOURCE_GROUP_ERROR"
 
 // SetUpRestHandler is a hook to sets up the REST service.
 var SetUpRestHandler = func(*Service) (http.Handler, apiutil.APIServiceGroup) {
@@ -102,12 +107,52 @@ func (s *Service) checkServing() error {
 	return nil
 }
 
+func mockGetResourceGroupError(resourceGroupName string) error {
+	// TODO: simulate caller-side context cancellation/deadline and protobuf response-body
+	// errors from the client path; returning them here only covers server-originated gRPC errors.
+	mode := strings.TrimSpace(strings.ToLower(os.Getenv(mockGetResourceGroupErrorEnvKey)))
+	if mode == "" {
+		log.Info("[test-get-rg] mock get resource group error skipped", zap.String("resource-group-name", resourceGroupName))
+		return nil
+	}
+	returnMockErr := func(err error) error {
+		log.Warn("[test-get-rg] mock get resource group error injected",
+			zap.String("mode", mode),
+			zap.String("resource-group-name", resourceGroupName),
+			zap.Error(err))
+		return err
+	}
+
+	switch mode {
+	case "unavailable":
+		return returnMockErr(status.Error(codes.Unavailable, "mock resource manager unavailable"))
+	case "leader_change":
+		return returnMockErr(errs.ErrNotLeader)
+	case "grpc_canceled":
+		return returnMockErr(status.Error(codes.Canceled, "mock resource manager canceled"))
+	case "grpc_deadline_exceeded":
+		return returnMockErr(status.Error(codes.DeadlineExceeded, "mock resource manager deadline exceeded"))
+	case "permission_denied":
+		return returnMockErr(status.Error(codes.PermissionDenied, "mock resource manager permission denied"))
+	case "not_found":
+		return returnMockErr(errs.ErrResourceGroupNotExists.FastGenByArgs(resourceGroupName))
+	default:
+		return returnMockErr(status.Errorf(codes.InvalidArgument, "unsupported %s mode %q", mockGetResourceGroupErrorEnvKey, mode))
+	}
+}
+
 // GetResourceGroup implements ResourceManagerServer.GetResourceGroup.
 func (s *Service) GetResourceGroup(_ context.Context, req *rmpb.GetResourceGroupRequest) (*rmpb.GetResourceGroupResponse, error) {
+	log.Info("[test-get-rg] get resource group request received", zap.String("resource-group-name", req.GetResourceGroupName()))
 	if err := s.checkServing(); err != nil {
 		return nil, err
 	}
 	keyspaceID := ExtractKeyspaceID(req.GetKeyspaceId())
+	if req.GetResourceGroupName() != DefaultResourceGroupName {
+		if err := mockGetResourceGroupError(req.GetResourceGroupName()); err != nil {
+			return nil, err
+		}
+	}
 	rg, err := s.manager.GetResourceGroup(keyspaceID, req.ResourceGroupName, req.WithRuStats)
 	if err != nil {
 		return nil, err

@@ -57,6 +57,35 @@ func TestKeyspaceGroupTestsuite(t *testing.T) {
 	suite.Run(t, new(keyspaceGroupTestSuite))
 }
 
+func (suite *keyspaceGroupTestSuite) TestShowKeyspaceGroupHidesKeyspacesByDefault() {
+	re := suite.Require()
+	cmd := ctl.GetRootCmd()
+	defaultKeyspaceGroupID := strconv.FormatUint(uint64(constant.DefaultKeyspaceGroupID), 10)
+	args := []string{"-u", suite.pdAddr, "keyspace-group"}
+
+	output, err := tests.ExecuteCommand(cmd, append(args, defaultKeyspaceGroupID)...)
+	re.NoError(err)
+	re.NotContains(string(output), "\"keyspaces\"")
+	var raw map[string]any
+	re.NoError(json.Unmarshal(output, &raw))
+	_, ok := raw["keyspaces"]
+	re.False(ok)
+	var keyspaceGroup endpoint.KeyspaceGroup
+	re.NoError(json.Unmarshal(output, &keyspaceGroup))
+	re.Equal(constant.DefaultKeyspaceGroupID, keyspaceGroup.ID)
+
+	argsWithKeyspaces := []string{"-u", suite.pdAddr, "keyspace-group", "--show-keyspaces"}
+	testutil.Eventually(re, func() bool {
+		output, err = tests.ExecuteCommand(cmd, append(argsWithKeyspaces, defaultKeyspaceGroupID)...)
+		re.NoError(err)
+		re.Contains(string(output), "\"keyspaces\"")
+		keyspaceGroup = endpoint.KeyspaceGroup{}
+		err = json.Unmarshal(output, &keyspaceGroup)
+		re.NoError(err)
+		return slices.Contains(keyspaceGroup.Keyspaces, constant.DefaultKeyspaceID)
+	})
+}
+
 func (suite *keyspaceGroupTestSuite) SetupTest() {
 	re := suite.Require()
 	suite.ctx, suite.cancel = context.WithCancel(context.Background())
@@ -138,7 +167,7 @@ func (suite *keyspaceGroupTestSuite) TestExternalAllocNodeWhenStart() {
 	cmd := ctl.GetRootCmd()
 	// check keyspace group information.
 	defaultKeyspaceGroupID := strconv.FormatUint(uint64(constant.DefaultKeyspaceGroupID), 10)
-	args := []string{"-u", suite.pdAddr, "keyspace-group"}
+	args := []string{"-u", suite.pdAddr, "keyspace-group", "--show-keyspaces"}
 	testutil.Eventually(re, func() bool {
 		output, err := tests.ExecuteCommand(cmd, append(args, defaultKeyspaceGroupID)...)
 		re.NoError(err)
@@ -267,7 +296,7 @@ func (suite *keyspaceGroupTestSuite) TestMergeKeyspaceGroup() {
 	output, err = tests.ExecuteCommand(cmd, args...)
 	re.NoError(err)
 	strings.Contains(string(output), "Success")
-	args = []string{"-u", suite.pdAddr, "keyspace-group", defaultKeyspaceGroupID}
+	args = []string{"-u", suite.pdAddr, "keyspace-group", "--show-keyspaces", defaultKeyspaceGroupID}
 	output, err = tests.ExecuteCommand(cmd, args...)
 	re.NoError(err)
 	var keyspaceGroup endpoint.KeyspaceGroup
@@ -303,7 +332,7 @@ func (suite *keyspaceGroupTestSuite) TestMergeKeyspaceGroup() {
 	output, err = tests.ExecuteCommand(cmd, args...)
 	re.NoError(err)
 	strings.Contains(string(output), "Success")
-	args = []string{"-u", suite.pdAddr, "keyspace-group", defaultKeyspaceGroupID}
+	args = []string{"-u", suite.pdAddr, "keyspace-group", "--show-keyspaces", defaultKeyspaceGroupID}
 	output, err = tests.ExecuteCommand(cmd, args...)
 	re.NoError(err)
 	err = json.Unmarshal(output, &keyspaceGroup)
@@ -530,7 +559,7 @@ func (suite *keyspaceGroupTestSuite) checkKeyspaceContains(keyspaceGroupID uint3
 	re := suite.Require()
 	cmd := ctl.GetRootCmd()
 	keyspaceGroupIDStr := strconv.FormatUint(uint64(keyspaceGroupID), 10)
-	args := []string{"-u", suite.pdAddr, "keyspace-group"}
+	args := []string{"-u", suite.pdAddr, "keyspace-group", "--show-keyspaces"}
 
 	// Manager may not initialize when the server starts, so we need to wait for it.
 	testutil.Eventually(re, func() bool {

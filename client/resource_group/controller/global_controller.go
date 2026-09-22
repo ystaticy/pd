@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	goerrors "errors"
+	"io"
 	"slices"
 	"strings"
 	"sync"
@@ -624,6 +625,62 @@ func (c *ResourceGroupsController) getDegradedResourceGroup(resourceGroupName st
 	return group
 }
 
+func isAcquireTokenBucketsRPCError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if goerrors.Is(err, context.Canceled) || goerrors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	causeErr := errors.Cause(err)
+	if errs.IsLeaderChange(causeErr) {
+		return true
+	}
+	if goerrors.Is(causeErr, io.EOF) ||
+		strings.Contains(causeErr.Error(), "failed to get the stream connection") {
+		return true
+	}
+	switch status.Code(causeErr) {
+	case codes.Unavailable, codes.DeadlineExceeded:
+		return true
+	default:
+		return false
+	}
+}
+
+func buildDegradedTokenBucketResponses(
+	requests []*rmpb.TokenBucketRequest,
+	degradedRUSettings *rmpb.GroupRequestUnitSettings,
+) []*rmpb.TokenBucketResponse {
+	if degradedRUSettings == nil || degradedRUSettings.RU == nil || degradedRUSettings.RU.Settings == nil {
+		return nil
+	}
+	settings := degradedRUSettings.RU.Settings
+	fillRate := float64(settings.GetFillRate())
+	grantedTokens := fillRate * defaultTargetPeriod.Seconds()
+	if grantedTokens < fillRate {
+		grantedTokens = fillRate
+	}
+	responses := make([]*rmpb.TokenBucketResponse, 0, len(requests))
+	for _, request := range requests {
+		responses = append(responses, &rmpb.TokenBucketResponse{
+			ResourceGroupName: request.GetResourceGroupName(),
+			GrantedRUTokens: []*rmpb.GrantedRUTokenBucket{
+				{
+					GrantedTokens: &rmpb.TokenBucket{
+						Tokens: grantedTokens,
+						Settings: &rmpb.TokenLimitSettings{
+							FillRate:   settings.GetFillRate(),
+							BurstLimit: settings.GetBurstLimit(),
+						},
+					},
+				},
+			},
+		})
+	}
+	return responses
+}
+
 // tryGetResourceGroupController will try to get the resource group controller from local cache first.
 // If the local cache misses, it will then call gRPC to fetch the resource group info from the remote server.
 // If `useTombstone` is true, it will return the resource group controller even if it is marked as tombstone.
@@ -810,11 +867,19 @@ func (c *ResourceGroupsController) sendTokenBucketRequests(ctx context.Context, 
 		resp, err := c.provider.AcquireTokenBuckets(ctx, req)
 		latency := time.Since(now)
 		if err != nil {
-			// Don't log any errors caused by the stopper canceling the context.
-			if !errors.ErrorEqual(err, context.Canceled) {
+			resp = nil
+			if isAcquireTokenBucketsRPCError(err) && c.degradedRUSettings != nil {
+				resp = buildDegradedTokenBucketResponses(req.Requests, c.degradedRUSettings)
+				if resp != nil {
+					log.Warn("[resource group controller] token bucket rpc error, use degraded response",
+						zap.Error(err))
+				}
+			}
+			// Keep the RPC failure observable even when a local fallback response
+			// allows the controller to continue serving requests.
+			if resp == nil && !goerrors.Is(err, context.Canceled) {
 				log.Warn("[resource group controller] token bucket rpc error", zap.Error(err))
 			}
-			resp = nil
 			metrics.FailedTokenRequestDuration.Observe(latency.Seconds())
 		} else {
 			metrics.SuccessfulTokenRequestDuration.Observe(latency.Seconds())

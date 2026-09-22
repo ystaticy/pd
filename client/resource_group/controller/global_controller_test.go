@@ -22,6 +22,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"testing"
 	"time"
 
@@ -537,6 +538,299 @@ func TestGetResourceGroup(t *testing.T) {
 		re.Nil(gc)
 		mockProvider.AssertNumberOfCalls(t, "GetResourceGroup", 1)
 	})
+}
+
+func TestIsAcquireTokenBucketsRPCError(t *testing.T) {
+	testCases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "unavailable",
+			err:  status.Error(codes.Unavailable, "resource manager unavailable"),
+			want: true,
+		},
+		{
+			name: "deadline exceeded",
+			err:  status.Error(codes.DeadlineExceeded, "resource manager deadline exceeded"),
+			want: true,
+		},
+		{
+			name: "wrapped unavailable",
+			err:  errors.WithStack(status.Error(codes.Unavailable, "resource manager unavailable")),
+			want: true,
+		},
+		{
+			name: "stream eof",
+			err:  io.EOF,
+			want: true,
+		},
+		{
+			name: "stream connection failure",
+			err:  errors.New("failed to get the stream connection"),
+			want: true,
+		},
+		{
+			name: "not found",
+			err:  status.Error(codes.NotFound, "resource group not found"),
+		},
+		{
+			name: "invalid argument",
+			err:  status.Error(codes.InvalidArgument, "invalid request"),
+		},
+		{
+			name: "permission denied",
+			err:  status.Error(codes.PermissionDenied, "permission denied"),
+		},
+		{
+			name: "caller canceled",
+			err:  context.Canceled,
+		},
+		{
+			name: "caller deadline exceeded",
+			err:  context.DeadlineExceeded,
+		},
+		{
+			name: "plain error",
+			err:  errors.New("plain error"),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, isAcquireTokenBucketsRPCError(tc.err))
+		})
+	}
+}
+
+func TestBuildDegradedTokenBucketResponses(t *testing.T) {
+	degradedSettings := &rmpb.GroupRequestUnitSettings{
+		RU: &rmpb.TokenBucket{
+			Settings: &rmpb.TokenLimitSettings{
+				FillRate:   100,
+				BurstLimit: 200,
+			},
+		},
+	}
+	requests := []*rmpb.TokenBucketRequest{
+		{ResourceGroupName: "rg1"},
+		{ResourceGroupName: "rg2"},
+	}
+
+	require.Nil(t, buildDegradedTokenBucketResponses(requests, nil))
+	responses := buildDegradedTokenBucketResponses(requests, degradedSettings)
+	require.Len(t, responses, 2)
+	require.Equal(t, "rg1", responses[0].GetResourceGroupName())
+	require.Len(t, responses[0].GetGrantedRUTokens(), 1)
+	require.Equal(t, 500., responses[0].GetGrantedRUTokens()[0].GetGrantedTokens().GetTokens())
+	require.Equal(t, uint64(100), responses[0].GetGrantedRUTokens()[0].GetGrantedTokens().GetSettings().GetFillRate())
+	require.Equal(t, int64(200), responses[0].GetGrantedRUTokens()[0].GetGrantedTokens().GetSettings().GetBurstLimit())
+	require.Zero(t, responses[0].GetGrantedRUTokens()[0].GetTrickleTimeMs())
+	require.Equal(t, "rg2", responses[1].GetResourceGroupName())
+}
+
+func TestSendTokenBucketRequestsUsesDegradedResponse(t *testing.T) {
+	ctx := context.Background()
+	degradedSettings := &rmpb.GroupRequestUnitSettings{
+		RU: &rmpb.TokenBucket{
+			Settings: &rmpb.TokenLimitSettings{
+				FillRate:   100,
+				BurstLimit: 200,
+			},
+		},
+	}
+	provider := newMockResourceGroupProvider()
+	controller, err := NewResourceGroupController(
+		ctx,
+		1,
+		provider,
+		nil,
+		constants.NullKeyspaceID,
+		WithDegradedRUSettings(degradedSettings),
+	)
+	require.NoError(t, err)
+
+	requests := []*rmpb.TokenBucketRequest{{ResourceGroupName: "test-group"}}
+	provider.On("AcquireTokenBuckets", mock.Anything, mock.Anything).
+		Return(([]*rmpb.TokenBucketResponse)(nil), status.Error(codes.Unavailable, "resource manager unavailable")).
+		Once()
+
+	controller.sendTokenBucketRequests(ctx, requests, FromPeriodReport, notifyMsg{})
+	select {
+	case responses := <-controller.tokenResponseChan:
+		require.Len(t, responses, 1)
+		require.Equal(t, "test-group", responses[0].GetResourceGroupName())
+		require.Len(t, responses[0].GetGrantedRUTokens(), 1)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for degraded token response")
+	}
+	provider.AssertCalled(t, "AcquireTokenBuckets", mock.Anything, mock.Anything)
+}
+
+func TestSendTokenBucketRequestsDoesNotFallbackLogicalError(t *testing.T) {
+	ctx := context.Background()
+	degradedSettings := &rmpb.GroupRequestUnitSettings{
+		RU: &rmpb.TokenBucket{
+			Settings: &rmpb.TokenLimitSettings{
+				FillRate:   100,
+				BurstLimit: 200,
+			},
+		},
+	}
+	provider := newMockResourceGroupProvider()
+	controller, err := NewResourceGroupController(
+		ctx,
+		1,
+		provider,
+		nil,
+		constants.NullKeyspaceID,
+		WithDegradedRUSettings(degradedSettings),
+	)
+	require.NoError(t, err)
+
+	provider.On("AcquireTokenBuckets", mock.Anything, mock.Anything).
+		Return(([]*rmpb.TokenBucketResponse)(nil), status.Error(codes.NotFound, "resource group not found")).
+		Once()
+
+	controller.sendTokenBucketRequests(
+		ctx,
+		[]*rmpb.TokenBucketRequest{{ResourceGroupName: "test-group"}},
+		FromPeriodReport,
+		notifyMsg{},
+	)
+	select {
+	case responses := <-controller.tokenResponseChan:
+		require.Nil(t, responses)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for token response")
+	}
+	provider.AssertCalled(t, "AcquireTokenBuckets", mock.Anything, mock.Anything)
+}
+
+func TestDegradedTokenResponseClearsPendingRequest(t *testing.T) {
+	ctx := context.Background()
+	degradedSettings := &rmpb.GroupRequestUnitSettings{
+		RU: &rmpb.TokenBucket{
+			Settings: &rmpb.TokenLimitSettings{
+				FillRate:   100,
+				BurstLimit: 200,
+			},
+		},
+	}
+	provider := newMockResourceGroupProvider()
+	controller, err := NewResourceGroupController(
+		ctx,
+		1,
+		provider,
+		nil,
+		constants.NullKeyspaceID,
+		WithDegradedRUSettings(degradedSettings),
+	)
+	require.NoError(t, err)
+
+	group := &rmpb.ResourceGroup{
+		Name: defaultResourceGroupName,
+		Mode: rmpb.GroupMode_RUMode,
+		RUSettings: &rmpb.GroupRequestUnitSettings{
+			RU: &rmpb.TokenBucket{
+				Settings: &rmpb.TokenLimitSettings{
+					FillRate:   1000,
+					BurstLimit: 2000,
+				},
+			},
+		},
+	}
+	provider.On("GetResourceGroup", mock.Anything, defaultResourceGroupName, mock.Anything).
+		Return(group, nil).
+		Once()
+	gc, err := controller.tryGetResourceGroupController(ctx, defaultResourceGroupName, false)
+	require.NoError(t, err)
+
+	request := gc.collectRequestAndConsumption(periodicReport)
+	require.NotNil(t, request)
+	require.True(t, gc.run.requestInProgress)
+
+	provider.On("AcquireTokenBuckets", mock.Anything, mock.Anything).
+		Return(([]*rmpb.TokenBucketResponse)(nil), status.Error(codes.Unavailable, "resource manager unavailable")).
+		Once()
+	controller.sendTokenBucketRequests(ctx, []*rmpb.TokenBucketRequest{request}, FromPeriodReport, notifyMsg{})
+
+	var responses []*rmpb.TokenBucketResponse
+	select {
+	case responses = <-controller.tokenResponseChan:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for degraded token response")
+	}
+	require.NotNil(t, responses)
+	controller.handleTokenBucketResponse(responses)
+	require.False(t, gc.run.requestInProgress)
+	require.True(t, gc.initialRequestCompleted.Load())
+	provider.AssertCalled(t, "GetResourceGroup", mock.Anything, defaultResourceGroupName, mock.Anything)
+	provider.AssertCalled(t, "AcquireTokenBuckets", mock.Anything, mock.Anything)
+}
+
+func TestSendTokenBucketRequestsUsesRealResponseAfterFallback(t *testing.T) {
+	ctx := context.Background()
+	degradedSettings := &rmpb.GroupRequestUnitSettings{
+		RU: &rmpb.TokenBucket{
+			Settings: &rmpb.TokenLimitSettings{
+				FillRate:   100,
+				BurstLimit: 200,
+			},
+		},
+	}
+	provider := newMockResourceGroupProvider()
+	controller, err := NewResourceGroupController(
+		ctx,
+		1,
+		provider,
+		nil,
+		constants.NullKeyspaceID,
+		WithDegradedRUSettings(degradedSettings),
+	)
+	require.NoError(t, err)
+
+	requests := []*rmpb.TokenBucketRequest{{ResourceGroupName: "test-group"}}
+	provider.On("AcquireTokenBuckets", mock.Anything, mock.Anything).
+		Return(([]*rmpb.TokenBucketResponse)(nil), status.Error(codes.Unavailable, "resource manager unavailable")).
+		Once()
+	provider.On("AcquireTokenBuckets", mock.Anything, mock.Anything).
+		Return([]*rmpb.TokenBucketResponse{
+			{
+				ResourceGroupName: "test-group",
+				GrantedRUTokens: []*rmpb.GrantedRUTokenBucket{
+					{
+						GrantedTokens: &rmpb.TokenBucket{
+							Tokens: 7,
+							Settings: &rmpb.TokenLimitSettings{
+								FillRate:   9,
+								BurstLimit: 11,
+							},
+						},
+					},
+				},
+			},
+		}, nil).
+		Once()
+
+	controller.sendTokenBucketRequests(ctx, requests, FromPeriodReport, notifyMsg{})
+	select {
+	case responses := <-controller.tokenResponseChan:
+		require.Equal(t, 500., responses[0].GetGrantedRUTokens()[0].GetGrantedTokens().GetTokens())
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for degraded token response")
+	}
+
+	controller.sendTokenBucketRequests(ctx, requests, FromPeriodReport, notifyMsg{})
+	select {
+	case responses := <-controller.tokenResponseChan:
+		require.Equal(t, float64(7), responses[0].GetGrantedRUTokens()[0].GetGrantedTokens().GetTokens())
+		require.Equal(t, uint64(9), responses[0].GetGrantedRUTokens()[0].GetGrantedTokens().GetSettings().GetFillRate())
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for real token response")
+	}
+	provider.AssertNumberOfCalls(t, "AcquireTokenBuckets", 2)
 }
 
 func TestGetResourceGroupRuntimeState(t *testing.T) {
